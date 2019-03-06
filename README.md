@@ -6,14 +6,14 @@ Algorand-Cloudstore is build on top of previous contribution/code-base at [[Tiny
 
 ## Modifications / Improvements
 
+* Improved Algorand psuedo-code comments and parameter settings
 * Fixed `maxpriority` logic for block proposal
 * Fixed `verifySort` to take external pubkey
-* New `emptyBlock` and `EmptyHash` logic for state transitioning
-* New `peer` and `handler` for network gossiping
-* New `vrfseed` implementation
-
+* Modified `emptyBlock` and `emptyHash` logic for state transitioning, with matching `vrfseed` verification
+* Modified `peer` and `handler` for actual {`TxMsg`,`NewBlockMsg`,`ProposalMsg`,`CertMsg`} network gossiping  
 
 ## TODO
 
-* Implement `certificate` for block validation
-* Fork resolving
+* Implement `certificate` for block validation (Stub ready)
+* Debug current Fork issue & VoteTimeOut resolution
+
