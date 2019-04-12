@@ -2,18 +2,17 @@ package wolk
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"math/big"
 	"math/rand"
-	"sync"
+	"sort"
 	"time"
 
 	common "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/mkchungs/algorand/crypto"
 	wolkcommon "github.com/mkchungs/algorand/common"
+	"github.com/mkchungs/algorand/crypto"
 )
 
 var (
@@ -461,6 +460,7 @@ func (alg *Algorand) committeeVote(round uint64, step uint64, expectedNum int, h
 		voteMsg := &VoteMessage{
 			BlockNumber: round,
 			Step:        step,
+			Sub:         uint64(j),
 			VRF:         vrf,
 			Proof:       proof,
 			ParentHash:  alg.chain.last.Hash(),
@@ -574,9 +574,10 @@ func (alg *Algorand) reduction(round uint64, hash common.Hash) common.Hash {
 // Algorithm 8: binaryBA executes until consensus is reached on either the given `hash` or `empty_hash`.
 func (alg *Algorand) binaryBA(round uint64, hash common.Hash) common.Hash {
 	var (
-		step = uint64(1)
-		r    = hash
-		err  error
+		step         = uint64(1)
+		preVoteRound = uint64(10)
+		r            = hash
+		err          error
 	)
 	empty := alg.emptyHash(round, alg.chain.last.Hash(), alg.chain.last.Seed)
 	defer func() {
@@ -587,12 +588,12 @@ func (alg *Algorand) binaryBA(round uint64, hash common.Hash) common.Hash {
 		r, err = alg.countVotes(round, step, thresholdOfBAStep, expectedCommitteeMembers, lamdaStep)
 		if err == errCountVotesTimeout {
 			r = hash
-		} else if r != empty {
-			for s := step + 1; s <= step+3; s++ {
+		} else if !bytes.Equal(r.Bytes(), empty.Bytes()) {
+			for s := step + 1; s <= step+preVoteRound; s++ {
 				//step 2 and 3
 				alg.committeeVote(round, s, expectedCommitteeMembers, r)
 			}
-			if step == 1 {
+			if step == uint64(1) {
 				alg.committeeVote(round, FINAL, expectedFinalCommitteeMembers, r)
 			}
 			return r
@@ -603,8 +604,8 @@ func (alg *Algorand) binaryBA(round uint64, hash common.Hash) common.Hash {
 		r, err = alg.countVotes(round, step, thresholdOfBAStep, expectedCommitteeMembers, lamdaStep)
 		if err == errCountVotesTimeout {
 			r = empty
-		} else if r == empty {
-			for s := step + 1; s <= step+3; s++ {
+		} else if bytes.Equal(r.Bytes(), empty.Bytes()) {
+			for s := step + 1; s <= step+preVoteRound; s++ {
 				alg.committeeVote(round, s, expectedCommitteeMembers, r)
 			}
 			return r
@@ -620,23 +621,46 @@ func (alg *Algorand) binaryBA(round uint64, hash common.Hash) common.Hash {
 				r = empty
 			}
 		}
-		//MK NOTE: looks like it's missing counter here
 		step++
 	}
 
 	log.Info(fmt.Sprintf("reach the maxstep hang forever [algorand:binaryBA]"))
 	// hang forever
 	// No consensus after MAXSTEPS; assume network problems, and rely on 8.2 ro recover liveness
-	<-alg.hangForever
+	<-alg.chain.hangForever
 	return common.Hash{}
+}
+
+//TODO: remove votes from memory afterward
+func makeCert(votes []*VoteMessage) *Certificate {
+	sort.Sort(VotesOrderedbyHash(votes))
+
+	cert := new(Certificate)
+	if len(votes) > 0 {
+		firstVote := votes[0]
+		cert.BlockNumber = firstVote.BlockNumber
+		cert.BlockHash = firstVote.BlockHash
+		cert.ParentHash = firstVote.ParentHash
+	}
+
+	compactedVotes := []*CompactedVote{}
+	for _, vote := range votes {
+		compactedVotes = append(compactedVotes, vote.Compacted())
+	}
+	cert.CompactedVotes = compactedVotes
+	return cert
 }
 
 // Algorithm 5: countVotes counts votes for round and step.
 func (alg *Algorand) countVotes(round uint64, step uint64, threshold float64, expectedNum int, timeout time.Duration) (common.Hash, error) {
 	expired := time.NewTimer(timeout)
 	counts := make(map[common.Hash]int)
+	totalVotes := make(map[common.Hash][]*VoteMessage)
 	voters := make(map[string]struct{})
 	it := alg.chain.protocolManager.voteIterator(round, step)
+	var thresholdIsMet bool
+	var proposedHash common.Hash
+
 	var s string
 	for {
 		msg := it.next()
@@ -644,12 +668,30 @@ func (alg *Algorand) countVotes(round uint64, step uint64, threshold float64, ex
 			select {
 			case <-expired.C:
 				// timeout
+				s = fmt.Sprintf("Receive votes %v (<%v) at step %v in Block %v [Node%v]", counts[proposedHash], uint64(float64(expectedNum)*threshold), getStepType(step), round, alg.id)
 				log.Info(fmt.Sprintf("[algorand:countVotes] VotesTimeoutT at step %v in Block %v [Node%v] %s", getStepType(step), round, alg.id, s))
+				//remove votes from mem
+				//alg.chain.protocolManager.clearVotes(round, step)
 				return common.Hash{}, errCountVotesTimeout
+
 			default:
+				if thresholdIsMet {
+					cert := makeCert(totalVotes[proposedHash])
+					//alg.chain.protocolManager.clearVotes(round, step)
+					alg.chain.protocolManager.addCert(round, step, cert)
+					log.Info(fmt.Sprintf("[algorand:countVotes] Receive critical votes %v (>=%v) at step %v in Block %v [Node%v]", counts[proposedHash], uint64(float64(expectedNum)*threshold), getStepType(step), round, alg.id))
+					//log.Info(fmt.Sprintf("[algorand:countVotes] Tallied Votes at step %v in Block %v [Node%v]", getStepType(step), round, alg.id), "cert", cert)
+					return proposedHash, nil
+				}
 			}
 		} else {
 			voteMsg := msg.(*VoteMessage)
+			isSameHash := bytes.Equal(proposedHash.Bytes(), voteMsg.BlockHash.Bytes())
+
+			if thresholdIsMet && !isSameHash {
+				continue
+			}
+
 			votes, hash, _ := alg.processMsg(msg.(*VoteMessage), expectedNum)
 			pubkey := voteMsg.RecoverPubkey()
 			if _, exist := voters[string(pubkey.Bytes())]; exist || votes == 0 {
@@ -657,12 +699,22 @@ func (alg *Algorand) countVotes(round uint64, step uint64, threshold float64, ex
 			}
 			voters[string(pubkey.Bytes())] = struct{}{}
 			counts[hash] += votes
-			// if we got enough votes, then output the target hash
-			if uint64(counts[hash]) >= uint64(float64(expectedNum)*threshold) {
-				log.Info(fmt.Sprintf("[algorand:countVotes] Receive critical votes %v (>=%v) at step %v in Block %v [Node%v]", counts[hash], uint64(float64(expectedNum)*threshold), getStepType(step), round, alg.id))
-				return hash, nil
+
+			if _, exist := totalVotes[hash]; !exist {
+				totalVotes[hash] = []*VoteMessage{voteMsg}
 			} else {
-				s = fmt.Sprintf("Receive votes %v (<%v) at step %v in Block %v [Node%v]", counts[hash], uint64(float64(expectedNum)*threshold), getStepType(step), round, alg.id)
+				totalVotes[hash] = append(totalVotes[hash], voteMsg)
+			}
+
+			if !thresholdIsMet {
+				if uint64(counts[hash]) >= uint64(float64(expectedNum)*threshold) {
+					thresholdIsMet = true
+					proposedHash = hash
+				} else if !isSameHash {
+					if counts[hash] > counts[proposedHash] {
+						proposedHash = hash
+					}
+				}
 			}
 		}
 	}
@@ -676,11 +728,14 @@ func (alg *Algorand) processMsg(message *VoteMessage, expectedNum int) (votes in
 
 	// discard messages that do not extend this chain
 	prevHash := message.ParentHash
-	if prevHash != alg.chain.last.Hash() {
+	if !bytes.Equal(prevHash.Bytes(), alg.chain.last.Hash().Bytes()) {
 		return 0, common.Hash{}, nil
 	}
 
 	votes = alg.verifySort(message.RecoverPubkey(), message.VRF, message.Proof, alg.sortitionSeed(message.BlockNumber), role(committee, message.BlockNumber, message.Step), expectedNum)
+	if uint64(votes) != message.Sub {
+		log.Error(fmt.Sprintf("[algorand:processMsg] Malicious Vote (sub: %d | claimed: %d) [Node%v]", votes, message.Sub, alg.id), "vote", message)
+	}
 	hash = message.BlockHash
 	vrf = message.VRF
 	return

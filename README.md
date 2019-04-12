@@ -11,9 +11,7 @@ Algorand-Cloudstore is build on top of previous contribution/code-base at [[Tiny
 * Fixed `verifySort` to take external pubkey
 * Modified `emptyBlock` and `emptyHash` logic for state transitioning, with matching `vrfseed` verification
 * Modified `peer` and `handler` for actual {`TxMsg`,`NewBlockMsg`,`ProposalMsg`,`CertMsg`} network gossiping  
-
+* Added `certificate`, `[]*VoteMessage`
 ## TODO
 
-* Implement `certificate` for block validation (Stub ready)
-* Debug current Fork issue & VoteTimeOut resolution
-
+* Implement `certificate` validation
